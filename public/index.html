@@ -1,0 +1,450 @@
+import express from 'express';
+import cors from 'cors';
+import bcrypt from 'bcryptjs';
+import multer from 'multer';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { v4 as uuidv4 } from 'uuid';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const rootDir = path.resolve(__dirname, '..');
+const publicDir = path.join(rootDir, 'public');
+const dataDir = path.join(rootDir, 'server', 'data');
+const objectsDir = path.join(rootDir, 'storage', 'objects');
+const usersPath = path.join(dataDir, 'users.json');
+const filesPath = path.join(dataDir, 'files.json');
+const activityPath = path.join(dataDir, 'activity.json');
+const bucketsPath = path.join(dataDir, 'buckets.json');
+const settingsPath = path.join(dataDir, 'settings.json');
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+const ensureDirs = () => {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(objectsDir, { recursive: true });
+  fs.mkdirSync(publicDir, { recursive: true });
+};
+
+const readJson = (file, fallback) => {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+    return fallback;
+  }
+};
+
+const writeJson = (file, data) => {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+};
+
+const state = {
+  users: readJson(usersPath, []),
+  files: readJson(filesPath, []),
+  activity: readJson(activityPath, []),
+  buckets: readJson(bucketsPath, []),
+  settings: readJson(settingsPath, [])
+};
+
+const saveAll = () => {
+  writeJson(usersPath, state.users);
+  writeJson(filesPath, state.files);
+  writeJson(activityPath, state.activity);
+  writeJson(bucketsPath, state.buckets);
+  writeJson(settingsPath, state.settings);
+};
+
+const sanitizeName = (name) => {
+  const clean = String(name || '').replace(/[<>:"/\\|?*\u0000-\u001F]/g, '').trim();
+  return clean || 'Untitled';
+};
+
+const extname = (name = '') => path.extname(name).replace('.', '').toLowerCase();
+
+const fileKind = (name = '', mime = '') => {
+  const e = extname(name);
+  const m = String(mime || '').toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(e)) return 'image';
+  if (['mp4', 'webm', 'mov', 'avi', 'mkv'].includes(e)) return 'video';
+  if (['mp3', 'wav', 'ogg', 'm4a'].includes(e)) return 'audio';
+  if (['pdf'].includes(e)) return 'document';
+  if (['txt', 'json', 'csv', 'md', 'xml', 'css', 'js', 'html'].includes(e)) return 'document';
+  if (m.startsWith('image/')) return 'image';
+  if (m.startsWith('video/')) return 'video';
+  if (m.startsWith('audio/')) return 'audio';
+  return 'other';
+};
+
+const userByToken = (token) => state.users.find((user) => user.token === String(token || '').replace('Bearer ', ''));
+
+const auth = (req, res, next) => {
+  const token = String(req.headers.authorization || '').replace('Bearer ', '') || req.query.token;
+  const user = userByToken(token);
+  if (!user) return res.status(401).json({ message: 'Authentication required' });
+  req.user = user;
+  next();
+};
+
+const writeActivity = (userId, action, itemName = '', detail = '') => {
+  state.activity.unshift({
+    id: uuidv4(),
+    userId,
+    action,
+    itemName,
+    detail,
+    createdAt: new Date().toISOString()
+  });
+  state.activity = state.activity.slice(0, 200); 
+  saveAll();
+};
+
+const ensureDemoData = () => {
+  if (state.users.length > 0) return;
+
+  const user = {
+    id: uuidv4(),
+    name: 'Demo User',
+    email: 'demo@cloudvault.app',
+    passwordHash: bcrypt.hashSync('demo123', 10),
+    token: `cv_${uuidv4()}`,
+    createdAt: new Date().toISOString()
+  };
+
+  state.users.push(user);
+
+  const defaultBucket = {
+    id: uuidv4(),
+    userId: user.id,
+    name: 'Main Storage',
+    description: 'Demo workspace',
+    createdAt: new Date().toISOString(),
+    access: 'private'
+  };
+  state.buckets.push(defaultBucket);
+
+  const folders = [
+    { id: uuidv4(), name: 'School', type: 'folder', parentId: null, ownerId: user.id, bucketId: defaultBucket.id, status: 'active', size: 0, favorite: false, shareMode: 'private', permissions: 'view', createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString() },
+    { id: uuidv4(), name: 'Projects', type: 'folder', parentId: null, ownerId: user.id, bucketId: defaultBucket.id, status: 'active', size: 0, favorite: true, shareMode: 'private', permissions: 'view', createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString() },
+  ];
+
+  const files = [
+    { id: uuidv4(), name: 'science.pdf', type: 'file', parentId: folders[0].id, ownerId: user.id, bucketId: defaultBucket.id, status: 'active', size: 1500000, favorite: true, shareMode: 'link', permissions: 'download', mimeType: 'application/pdf', createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString(), storagePath: null },
+    { id: uuidv4(), name: 'notes.txt', type: 'file', parentId: folders[0].id, ownerId: user.id, bucketId: defaultBucket.id, status: 'active', size: 32000, favorite: false, shareMode: 'private', permissions: 'view', mimeType: 'text/plain', createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString(), storagePath: null },
+    { id: uuidv4(), name: 'launch-plan.md', type: 'file', parentId: folders[1].id, ownerId: user.id, bucketId: defaultBucket.id, status: 'active', size: 8000, favorite: false, shareMode: 'private', permissions: 'view', mimeType: 'text/markdown', createdAt: new Date().toISOString(), modifiedAt: new Date().toISOString(), storagePath: null },
+  ];
+
+  for (const item of files) {
+    const fileName = `${uuidv4()}${path.extname(item.name)}`;
+    const diskPath = path.join(objectsDir, fileName);
+    fs.writeFileSync(diskPath, `Demo content for ${item.name}`);
+    item.storagePath = diskPath;
+    state.files.push(item);
+  }
+
+  state.files.push(...folders);
+
+  state.activity.push({
+    id: uuidv4(),
+    userId: user.id,
+    action: 'Uploaded file',
+    itemName: 'science.pdf',
+    detail: 'Demo project file',
+    createdAt: new Date().toISOString()
+  });
+
+  state.settings.push({ userId: user.id, theme: 'dark', accentColor: '#6d7bff', compactMode: false, animations: true, gridDefault: 'list' });
+  saveAll();
+};
+
+const getStorageSummary = (userId) => {
+  const all = state.files.filter((item) => item.ownerId === userId && item.status !== 'trash');
+  const files = all.filter((item) => item.type === 'file');
+  const folders = all.filter((item) => item.type === 'folder');
+  const used = files.reduce((sum, item) => sum + Number(item.size || 0), 0);
+  const total = 10 * 1024 * 1024 * 1024;
+  return {
+    total,
+    used,
+    available: total - used,
+    fileCount: files.length,
+    folderCount: folders.length,
+    byType: {
+      images: files.filter((item) => fileKind(item.name, item.mimeType) === 'image').reduce((sum, item) => sum + Number(item.size || 0), 0),
+      videos: files.filter((item) => fileKind(item.name, item.mimeType) === 'video').reduce((sum, item) => sum + Number(item.size || 0), 0),
+      documents: files.filter((item) => fileKind(item.name, item.mimeType) === 'document').reduce((sum, item) => sum + Number(item.size || 0), 0),
+      audio: files.filter((item) => fileKind(item.name, item.mimeType) === 'audio').reduce((sum, item) => sum + Number(item.size || 0), 0),
+      archives: files.filter((item) => ['zip', 'rar', 'gz', 'tar', '7z'].includes(extname(item.name))).reduce((sum, item) => sum + Number(item.size || 0), 0),
+      other: files.filter((item) => !['image', 'video', 'document', 'audio'].includes(fileKind(item.name, item.mimeType))).reduce((sum, item) => sum + Number(item.size || 0), 0),
+    }
+  };
+};
+
+const formatBytes = (bytes = 0) => {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+};
+
+ensureDirs();
+ensureDemoData();
+
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, objectsDir),
+  filename: (_req, file, cb) => cb(null, `${Date.now()}-${uuidv4()}${path.extname(file.originalname || '')}`)
+});
+const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body || {};
+  const user = state.users.find((entry) => entry.email.toLowerCase() === String(email || '').toLowerCase());
+  if (!user || !bcrypt.compareSync(String(password || ''), user.passwordHash)) {
+    return res.status(401).json({ message: 'Invalid email or password.' });
+  }
+  user.token = `cv_${uuidv4()}`;
+  saveAll();
+  writeActivity(user.id, 'Signed in', 'Account', 'Session started');
+  res.json({ token: user.token, user: { id: user.id, name: user.name, email: user.email } });
+});
+
+app.post('/api/auth/signup', (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password) return res.status(400).json({ message: 'Missing required fields.' });
+  const normalizedEmail = String(email).trim().toLowerCase();
+  if (state.users.some((item) => item.email.toLowerCase() === normalizedEmail)) return res.status(409).json({ message: 'User already exists.' });
+  const user = {
+    id: uuidv4(),
+    name: sanitizeName(name),
+    email: normalizedEmail,
+    passwordHash: bcrypt.hashSync(password, 10),
+    token: `cv_${uuidv4()}`,
+    createdAt: new Date().toISOString()
+  };
+  state.users.push(user);
+  state.buckets.push({ id: uuidv4(), userId: user.id, name: 'Main Storage', description: 'Fresh bucket', createdAt: new Date().toISOString(), access: 'private' });
+  saveAll();
+  writeActivity(user.id, 'Signed up', 'Account', 'Welcome to CloudVault');
+  res.status(201).json({ token: user.token, user: { id: user.id, name: user.name, email: user.email } });
+});
+
+app.get('/api/auth/me', auth, (req, res) => {
+  res.json({ user: { id: req.user.id, name: req.user.name, email: req.user.email } });
+});
+
+app.get('/api/settings', auth, (req, res) => {
+  const settings = state.settings.find((entry) => entry.userId === req.user.id) || { userId: req.user.id, theme: 'dark', accentColor: '#6d7bff', compactMode: false, animations: true, gridDefault: 'list' };
+  res.json(settings);
+});
+
+app.post('/api/settings', auth, (req, res) => {
+  const existing = state.settings.find((entry) => entry.userId === req.user.id) || { userId: req.user.id };
+  const next = { ...existing, ...req.body, userId: req.user.id };
+  if (!state.settings.some((entry) => entry.userId === req.user.id)) state.settings.push(next);
+  else Object.assign(existing, next);
+  saveAll();
+  res.json(next);
+});
+
+app.get('/api/buckets', auth, (req, res) => {
+  const buckets = state.buckets.filter((bucket) => bucket.userId === req.user.id).map((bucket) => {
+    const entries = state.files.filter((file) => file.bucketId === bucket.id && file.ownerId === req.user.id && file.status !== 'trash');
+    return { ...bucket, fileCount: entries.length, storageUsed: entries.reduce((sum, entry) => sum + Number(entry.size || 0), 0) };
+  });
+  res.json(buckets);
+});
+
+app.post('/api/buckets', auth, (req, res) => {
+  const { name, description } = req.body || {};
+  if (!name) return res.status(400).json({ message: 'Bucket name is required.' });
+  const bucket = { id: uuidv4(), userId: req.user.id, name: sanitizeName(name), description: String(description || ''), createdAt: new Date().toISOString(), access: 'private' };
+  state.buckets.push(bucket);
+  saveAll();
+  writeActivity(req.user.id, 'Created bucket', bucket.name, description || 'Primary bucket');
+  res.status(201).json(bucket);
+});
+
+app.get('/api/files', auth, (req, res) => {
+  const search = String(req.query.search || '').toLowerCase();
+  const parentId = req.query.parentId && req.query.parentId !== 'null' ? req.query.parentId : null;
+  let items = state.files.filter((item) => item.ownerId === req.user.id && item.status !== 'trash' && (parentId === null ? item.parentId === null : item.parentId === parentId));
+  if (search) {
+    items = items.filter((item) => `${item.name} ${item.type} ${extname(item.name)}`.toLowerCase().includes(search));
+  }
+  items = items.map((item) => ({ ...item, kind: item.type === 'folder' ? 'folder' : fileKind(item.name, item.mimeType), extension: extname(item.name) }));
+  items.sort((a, b) => String(b.modifiedAt || '').localeCompare(String(a.modifiedAt || '')));
+  res.json(items);
+});
+
+app.get('/api/files/trash', auth, (req, res) => {
+  const items = state.files.filter((item) => item.ownerId === req.user.id && item.status === 'trash');
+  res.json(items);
+});
+
+app.post('/api/files/upload', auth, upload.array('files'), (req, res) => {
+  const files = req.files || [];
+  const parentId = req.body.parentId && req.body.parentId !== 'null' ? req.body.parentId : null;
+  const bucketId = req.body.bucketId || state.buckets.find((bucket) => bucket.userId === req.user.id)?.id || null;
+
+  const created = files.map((file) => {
+    const item = {
+      id: uuidv4(),
+      name: sanitizeName(file.originalname),
+      type: 'file',
+      parentId,
+      ownerId: req.user.id,
+      bucketId,
+      mimeType: file.mimetype || 'application/octet-stream',
+      size: file.size,
+      favorite: false,
+      shareMode: 'private',
+      permissions: 'view',
+      status: 'active',
+      storagePath: path.join(objectsDir, file.filename),
+      createdAt: new Date().toISOString(),
+      modifiedAt: new Date().toISOString()
+    };
+    state.files.push(item);
+    writeActivity(req.user.id, 'Uploaded file', item.name, `stored in ${parentId || 'root'}`);
+    return item;
+  });
+  saveAll();
+  res.status(201).json(created);
+});
+
+app.post('/api/folders', auth, (req, res) => {
+  const { name, parentId = null } = req.body || {};
+  if (!name) return res.status(400).json({ message: 'Folder name required.' });
+  const folder = {
+    id: uuidv4(),
+    name: sanitizeName(name),
+    type: 'folder',
+    parentId: parentId && parentId !== 'null' ? parentId : null,
+    ownerId: req.user.id,
+    bucketId: state.buckets.find((bucket) => bucket.userId === req.user.id)?.id || null,
+    status: 'active',
+    size: 0,
+    favorite: false,
+    shareMode: 'private',
+    permissions: 'view',
+    createdAt: new Date().toISOString(),
+    modifiedAt: new Date().toISOString()
+  };
+  state.files.push(folder);
+  saveAll();
+  writeActivity(req.user.id, 'Created folder', folder.name, `Parent: ${parentId || 'root'}`);
+  res.status(201).json(folder);
+});
+
+app.patch('/api/files/:id/rename', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ message: 'Item not found.' });
+  item.name = sanitizeName(req.body.name || item.name);
+  item.modifiedAt = new Date().toISOString();
+  saveAll();
+  writeActivity(req.user.id, 'Renamed item', item.name, 'Rename operation');
+  res.json(item);
+});
+
+app.post('/api/files/:id/favorite', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ message: 'Item not found.' });
+  item.favorite = !!req.body.favorite;
+  item.modifiedAt = new Date().toISOString();
+  saveAll();
+  res.json(item);
+});
+
+app.post('/api/files/:id/share', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ message: 'Item not found.' });
+  item.shareMode = req.body.shareMode || 'private';
+  item.permissions = req.body.permissions || 'view';
+  saveAll();
+  writeActivity(req.user.id, 'Shared item', item.name, `${item.shareMode} / ${item.permissions}`);
+  res.json(item);
+});
+
+app.post('/api/files/:id/delete', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ message: 'Item not found.' });
+  if (req.body.permanent) {
+    const index = state.files.findIndex((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+    state.files.splice(index, 1);
+    if (item.storagePath && fs.existsSync(item.storagePath)) fs.unlinkSync(item.storagePath);
+    saveAll();
+    writeActivity(req.user.id, 'Deleted permanently', item.name, 'Removed from storage');
+    return res.json({ success: true });
+  }
+  item.status = 'trash';
+  item.deletedAt = new Date().toISOString();
+  saveAll();
+  writeActivity(req.user.id, 'Moved to Trash', item.name, 'Deleted item');
+  res.json({ success: true });
+});
+
+app.post('/api/files/:id/restore', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id);
+  if (!item) return res.status(404).json({ message: 'Item not found.' });
+  item.status = 'active';
+  item.deletedAt = null;
+  saveAll();
+  writeActivity(req.user.id, 'Restored item', item.name, 'Recovered from trash');
+  res.json(item);
+});
+
+app.get('/api/storage', auth, (req, res) => {
+  res.json(getStorageSummary(req.user.id));
+});
+
+app.get('/api/activity', auth, (req, res) => {
+  res.json(state.activity.filter((entry) => entry.userId === req.user.id).slice(0, 30));
+});
+
+app.get('/api/help', auth, (req, res) => {
+  const q = String(req.query.q || '').toLowerCase();
+  const topics = [
+    { title: 'How to upload', body: 'Click Upload Files or drag files onto the page.' },
+    { title: 'How folders work', body: 'Use New Folder to organize nested content in your workspace.' },
+    { title: 'How sharing works', body: 'Open share options on a file to generate a link with permissions.' },
+    { title: 'How Trash works', body: 'Deleted files are kept in Trash until you restore or permanently delete them.' },
+    { title: 'How buckets work', body: 'Buckets let you group files into containers, similar to project spaces.' },
+  ];
+  const filtered = q ? topics.filter((topic) => `${topic.title} ${topic.body}`.toLowerCase().includes(q)) : topics;
+  res.json(filtered);
+});
+
+app.get('/api/files/:id/download', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id && entry.status !== 'trash');
+  if (!item || item.type !== 'file') return res.status(404).json({ message: 'File not found.' });
+  if (!item.storagePath || !fs.existsSync(item.storagePath)) return res.status(404).json({ message: 'Missing file content.' });
+  res.download(item.storagePath, item.name);
+});
+
+app.get('/api/files/:id/content', auth, (req, res) => {
+  const item = state.files.find((entry) => entry.id === req.params.id && entry.ownerId === req.user.id && entry.status !== 'trash');
+  if (!item || item.type !== 'file') return res.status(404).json({ message: 'File not found.' });
+  if (!item.storagePath || !fs.existsSync(item.storagePath)) return res.status(404).json({ message: 'Missing file content.' });
+  res.sendFile(item.storagePath);
+});
+
+app.use(express.static(publicDir));
+app.get('*', (req, res) => {
+  if (req.path.startsWith('/api')) return res.status(404).json({ message: 'Not found' });
+  res.sendFile(path.join(publicDir, 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`CloudVault HTML app is running on http://localhost:${PORT}`);
+});
